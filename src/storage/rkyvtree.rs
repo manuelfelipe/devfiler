@@ -214,7 +214,12 @@ where
         while let Some((s, l)) = self.todo.pop() {
             let i = s + l / 2;
 
-            let node = &self.tree.data[i];
+            // Bounds check: if the archived data is corrupted, `i` might
+            // be out of bounds. Gracefully skip instead of panicking or
+            // triggering undefined behavior via out-of-bounds access.
+            let Some(node) = self.tree.data.get(i) else {
+                continue;
+            };
             if self.query.point() < &node.max {
                 // push left
                 {
@@ -241,5 +246,74 @@ where
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestTree = Tree<u64, u32>;
+
+    fn make_test_tree(intervals: Vec<(Range<u64>, u32)>) -> Vec<u8> {
+        let tree: TestTree = intervals.into_iter().collect();
+        rkyv::to_bytes::<_, 256>(&tree).unwrap().to_vec()
+    }
+
+    #[test]
+    fn query_point_returns_matching_elements() {
+        let bytes = make_test_tree(vec![(10..20, 1), (15..25, 2), (30..40, 3)]);
+        let archived = unsafe { rkyv::archived_root::<TestTree>(&bytes) };
+
+        let results: Vec<_> = archived.query_point(17).collect();
+        assert_eq!(results.len(), 2);
+
+        let results: Vec<_> = archived.query_point(35).collect();
+        assert_eq!(results.len(), 1);
+
+        let results: Vec<_> = archived.query_point(50).collect();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn query_point_on_empty_tree() {
+        let bytes = make_test_tree(vec![]);
+        let archived = unsafe { rkyv::archived_root::<TestTree>(&bytes) };
+
+        let results: Vec<_> = archived.query_point(10).collect();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn query_range_returns_overlapping_elements() {
+        let bytes = make_test_tree(vec![(10..20, 1), (15..25, 2), (30..40, 3)]);
+        let archived = unsafe { rkyv::archived_root::<TestTree>(&bytes) };
+
+        let results: Vec<_> = archived.query(12..18).collect();
+        assert_eq!(results.len(), 2);
+
+        let results: Vec<_> = archived.query(0..100).collect();
+        assert_eq!(results.len(), 3);
+
+        let results: Vec<_> = archived.query(50..60).collect();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn query_point_single_element() {
+        let bytes = make_test_tree(vec![(100..200, 42)]);
+        let archived = unsafe { rkyv::archived_root::<TestTree>(&bytes) };
+
+        let results: Vec<_> = archived.query_point(150).collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].value, 42);
+
+        // Boundary: start is inclusive
+        let results: Vec<_> = archived.query_point(100).collect();
+        assert_eq!(results.len(), 1);
+
+        // Boundary: end is exclusive
+        let results: Vec<_> = archived.query_point(200).collect();
+        assert_eq!(results.len(), 0);
     }
 }

@@ -29,7 +29,12 @@ use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Write};
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+
+/// Global counter for generating unique temp file suffixes to avoid races
+/// when multiple threads insert the same file ID concurrently.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Custom data store for symbol information.
 pub struct SymDb {
@@ -96,12 +101,13 @@ impl SymDb {
         // change the contents of files that might already be mmap'ed. Instead,
         // we write the new data to a fresh file and then atomically replace
         // the old one by moving over it.
-        let tmp_path = self.path_for_id(file_id, true);
-        if let Err(e) = std::fs::remove_file(&tmp_path) {
-            if e.kind() != ErrorKind::NotFound {
-                return Err(e).context("failed to remove previous file");
-            }
-        }
+        //
+        // We use a unique suffix for the temp file to avoid a race condition
+        // where multiple concurrent inserts for the same file_id would write
+        // to the same .temp file, potentially corrupting the data.
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!("{}.symtree.temp.{}", file_id.format_hex(), unique,);
+        let tmp_path = self.dir.join(tmp_name);
 
         // Serialize tree into the file.
         use rkyv::{
@@ -129,11 +135,15 @@ impl SymDb {
             .context("failed to write symtree to disk")?;
 
         let mut writer = serializer.into_serializer().into_inner();
-        writer.flush().context("failed to flush symbtree to disk")?;
+        writer.flush().context("failed to flush symtree to disk")?;
 
-        // Move temporary file to final location.
-        std::fs::rename(tmp_path, self.path_for_id(file_id, false))
-            .context("failed to move symtree to its final location")?;
+        // Move temporary file to final location. This is atomic on POSIX.
+        let final_path = self.path_for_id(file_id, false);
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            // Clean up the temp file on failure.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).context("failed to move symtree to its final location");
+        }
 
         // Invalidate cache for this file ID.
         self.cache.write().unwrap().remove(&file_id);
@@ -153,15 +163,25 @@ unsafe impl Send for MappedSymTree {}
 
 impl MappedSymTree {
     fn open(file: &File) -> Result<Self> {
-        unsafe {
-            let mapping = Mmap::map(file).context("failed to mmap symtree")?;
-            let tree = rkyv::archived_root::<SymTree>(&*mapping);
-            let tree_ptr: *const _ = tree;
-            Ok(MappedSymTree {
-                tree_ptr,
-                _mapping: mapping,
-            })
-        }
+        let mapping = unsafe { Mmap::map(file) }.context("failed to mmap symtree")?;
+
+        // Validate that the file is large enough to contain an archived
+        // SymTree root. Without this check, `archived_root` would compute
+        // an offset via wrapping subtraction, causing out-of-bounds access.
+        let min_size = core::mem::size_of::<ArchivedSymTree>();
+        anyhow::ensure!(
+            mapping.len() >= min_size,
+            "symtree file too small ({} bytes, need at least {})",
+            mapping.len(),
+            min_size,
+        );
+
+        let tree = unsafe { rkyv::archived_root::<SymTree>(&*mapping) };
+        let tree_ptr: *const _ = tree;
+        Ok(MappedSymTree {
+            tree_ptr,
+            _mapping: mapping,
+        })
     }
 }
 
