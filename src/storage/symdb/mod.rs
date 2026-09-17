@@ -88,6 +88,14 @@ impl SymDb {
         Ok(mapped)
     }
 
+    /// Remove one file ID from the lookup cache.
+    ///
+    /// A cached mapping is returned so its owner can choose when to release it.
+    /// Other cloned [`Arc`]s remain valid, and cached missing entries return `None`.
+    pub fn invalidate(&self, file_id: FileId) -> Option<Arc<MappedSymTree>> {
+        self.cache.write().unwrap().remove(&file_id).flatten()
+    }
+
     /// Insert symbols for the given file ID.
     ///
     /// Existing symbols are replaced.
@@ -135,8 +143,8 @@ impl SymDb {
         std::fs::rename(tmp_path, self.path_for_id(file_id, false))
             .context("failed to move symtree to its final location")?;
 
-        // Invalidate cache for this file ID.
-        self.cache.write().unwrap().remove(&file_id);
+        // Invalidate cache for this file ID after the replacement is visible.
+        drop(self.invalidate(file_id));
 
         Ok(())
     }
@@ -387,5 +395,116 @@ impl fmt::Display for SymbolizedFrame {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let sequence = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "devfiler-symdb-tests-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    fn id(value: u128) -> FileId {
+        FileId::from(value)
+    }
+
+    fn test_tree(name: &str) -> SymTree {
+        SymTree {
+            strings: vec![name.to_string()],
+            tree: rkyvtree::Tree::from_iter([rkyvtree::Element {
+                range: 1..2,
+                value: SymRange {
+                    func: StringRef(0),
+                    file: StringRef::NONE,
+                    call_file: StringRef::NONE,
+                    call_line: None,
+                    depth: 0,
+                    line_table: vec![],
+                },
+            }]),
+        }
+    }
+
+    #[test]
+    fn invalidating_one_mapping_keeps_other_mapping_cached() {
+        let temp = TestDir::new();
+        let db = SymDb::open_at(temp.path().to_path_buf()).unwrap();
+        let retained_id = id(1);
+        let victim_id = id(2);
+        db.insert(retained_id, test_tree("retained")).unwrap();
+        db.insert(victim_id, test_tree("victim")).unwrap();
+        let retained = db.get(retained_id).unwrap().unwrap();
+        let victim = db.get(victim_id).unwrap().unwrap();
+
+        std::fs::remove_file(db.path_for_id(victim_id, false)).unwrap();
+        let detached = db.invalidate(victim_id).unwrap();
+
+        assert!(Arc::ptr_eq(&victim, &detached));
+        assert!(Arc::ptr_eq(
+            &retained,
+            &db.get(retained_id).unwrap().unwrap()
+        ));
+        assert!(db.get(victim_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn caller_mapping_survives_unlink_and_cache_release() {
+        let temp = TestDir::new();
+        let db = SymDb::open_at(temp.path().to_path_buf()).unwrap();
+        let file_id = id(3);
+        db.insert(file_id, test_tree("caller-owned")).unwrap();
+        let mapped = db.get(file_id).unwrap().unwrap();
+        let weak = Arc::downgrade(&mapped);
+
+        std::fs::remove_file(db.path_for_id(file_id, false)).unwrap();
+        let detached = db.invalidate(file_id).unwrap();
+        drop(detached);
+
+        assert_eq!(mapped.strings[0].as_str(), "caller-owned");
+        assert!(weak.upgrade().is_some());
+        drop(mapped);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn invalidating_cached_miss_reveals_published_file() {
+        let temp = TestDir::new();
+        let reader = SymDb::open_at(temp.path().to_path_buf()).unwrap();
+        let publisher = SymDb::open_at(temp.path().to_path_buf()).unwrap();
+        let file_id = id(4);
+
+        assert!(reader.get(file_id).unwrap().is_none());
+        publisher.insert(file_id, test_tree("published")).unwrap();
+        assert!(reader.get(file_id).unwrap().is_none());
+        assert!(reader.invalidate(file_id).is_none());
+
+        let mapped = reader.get(file_id).unwrap().unwrap();
+        assert_eq!(mapped.strings[0].as_str(), "published");
     }
 }
